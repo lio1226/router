@@ -356,6 +356,15 @@ fn spec_messages_to_upstream(
                         "legacy function messages are not supported by vllm-chat"
                     ));
                 }
+                SpecChatMessage::Other(value) => {
+                    let role = value
+                        .get("role")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    return Err(anyhow!(
+                        "chat message role `{role}` is not supported by the router gRPC frontend"
+                    ));
+                }
             })
         })
         .collect()
@@ -558,6 +567,23 @@ mod tests {
                     && call.name == "weather"
                     && call.arguments == "{\"city\":\"Paris\"}"
         ));
+    }
+
+    #[test]
+    fn rejects_latest_reminder_on_grpc_path() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{
+                "role": "latest_reminder",
+                "content": "Follow the latest instructions."
+            }]
+        }))
+        .unwrap();
+
+        let error = spec_messages_to_upstream(&request.messages).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "chat message role `latest_reminder` is not supported by the router gRPC frontend"
+        );
     }
 
     #[test]

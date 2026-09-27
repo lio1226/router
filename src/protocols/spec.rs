@@ -114,8 +114,9 @@ impl<'de> Deserialize<'de> for ChatMessage {
         let value = Value::deserialize(deserializer)?;
         let role = value
             .get("role")
-            .and_then(|r| r.as_str())
-            .ok_or_else(|| D::Error::custom("missing role field"))?;
+            .ok_or_else(|| D::Error::custom("missing role field"))?
+            .as_str()
+            .ok_or_else(|| D::Error::custom("role field must be a string"))?;
 
         match role {
             "assistant" => Ok(ChatMessage::Assistant {
@@ -4101,25 +4102,37 @@ mod tests {
                 "role": "latest_reminder",
                 "content": "Remember the latest user request.",
                 "metadata": {"source": "deepseek"}
-            }]
+            }],
+            "temperature": 0.25,
+            "max_tokens": 128,
+            "stream": true,
+            "model_specific_request_field": {
+                "priority": 1,
+                "enabled": true
+            }
         });
 
         let request: ChatCompletionRequest = serde_json::from_value(original.clone()).unwrap();
         assert!(matches!(&request.messages[0], ChatMessage::Other(_)));
 
         let serialized = serde_json::to_value(request).unwrap();
-        assert_eq!(serialized["messages"], original["messages"]);
+        for (key, expected) in original.as_object().unwrap() {
+            assert_eq!(
+                &serialized[key], expected,
+                "request field `{key}` must survive the round trip"
+            );
+        }
     }
 
     #[test]
     fn test_chat_message_rejects_missing_or_non_string_role() {
-        for invalid in [
-            serde_json::json!({"content": "missing role"}),
-            serde_json::json!({"role": 42, "content": "invalid role"}),
-        ] {
-            let error = serde_json::from_value::<ChatMessage>(invalid).unwrap_err();
-            assert!(error.to_string().contains("missing role field"));
-        }
+        let missing_role = serde_json::json!({"content": "missing role"});
+        let error = serde_json::from_value::<ChatMessage>(missing_role).unwrap_err();
+        assert!(error.to_string().contains("missing role field"));
+
+        let non_string_role = serde_json::json!({"role": 42, "content": "invalid role"});
+        let error = serde_json::from_value::<ChatMessage>(non_string_role).unwrap_err();
+        assert!(error.to_string().contains("role field must be a string"));
     }
 
     #[test]
