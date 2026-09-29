@@ -357,10 +357,12 @@ fn spec_messages_to_upstream(
                     ));
                 }
                 SpecChatMessage::Other(value) => {
+                    // HTTP backends can forward unknown roles verbatim, but vllm-chat
+                    // cannot represent them, so the gRPC frontend rejects them.
                     let role = value
                         .get("role")
                         .and_then(serde_json::Value::as_str)
-                        .unwrap_or("unknown");
+                        .expect("ChatMessage::Other must contain a string `role`");
                     return Err(anyhow!(
                         "chat message role `{role}` is not supported by the router gRPC frontend"
                     ));
@@ -570,20 +572,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_latest_reminder_on_grpc_path() {
-        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
-            "messages": [{
-                "role": "latest_reminder",
-                "content": "Follow the latest instructions."
-            }]
-        }))
-        .unwrap();
+    fn rejects_unknown_roles_on_grpc_path() {
+        for role in ["latest_reminder", "developer"] {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "messages": [{
+                    "role": role,
+                    "content": "Model-specific instructions."
+                }]
+            }))
+            .unwrap();
 
-        let error = spec_messages_to_upstream(&request.messages).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "chat message role `latest_reminder` is not supported by the router gRPC frontend"
-        );
+            let error = spec_messages_to_upstream(&request.messages).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("chat message role `{role}` is not supported by the router gRPC frontend")
+            );
+        }
     }
 
     #[test]
