@@ -116,6 +116,24 @@ async fn finalize_decode_response(
     let status = decode_response.status();
     let mut headers = header_utils::preserve_response_headers(decode_response.headers());
     headers.remove(axum::http::header::CONTENT_LENGTH);
+    // The filtered headers must still describe opaque bytes forwarded by PD.
+    // Reqwest removes Content-Encoding itself when it decodes a response.
+    headers.remove(axum::http::header::CONTENT_ENCODING);
+    for value in decode_response
+        .headers()
+        .get_all(axum::http::header::CONTENT_ENCODING)
+        .iter()
+    {
+        headers.append(axum::http::header::CONTENT_ENCODING, value.clone());
+    }
+    let is_encoded = headers
+        .get_all(axum::http::header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| {
+            !value
+                .to_str()
+                .is_ok_and(|coding| coding.trim().eq_ignore_ascii_case("identity"))
+        });
 
     // Only successful generation bodies can be enriched. Preserve worker error
     // responses as opaque bodies; their status handling is a separate concern.
@@ -136,7 +154,8 @@ async fn finalize_decode_response(
 
     if is_streaming {
         let stream = decode_response.bytes_stream();
-        let body = if reconcile_cache {
+        // Encoded bytes cannot be parsed as SSE frames without decoding them.
+        let body = if reconcile_cache && !is_encoded {
             Body::from_stream(pd_cached_tokens::rewrite_sse_stream(stream, cached))
         } else {
             Body::from_stream(stream)
@@ -181,6 +200,7 @@ async fn finalize_decode_response(
     if changed {
         let encoded = serde_json::to_vec(&json)
             .map_err(|error| format!("Failed to serialize Decode response: {error}"))?;
+        headers.remove(axum::http::header::CONTENT_ENCODING);
         response_with_body(status, &headers, Body::from(encoded))
     } else {
         response_with_body(status, &headers, Body::from(original))
@@ -2717,6 +2737,201 @@ mod tests {
             .await
             .unwrap();
         (response, server)
+    }
+
+    // Fixed gzip fixtures for a JSON usage body and an SSE usage/DONE stream.
+    const GZIP_JSON: &[u8] = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xab\x56\x2a\x2d\x4e\x4c\x4f\x55\xb2\xaa\x56\x2a\x28\xca\xcf\x2d\x28\x89\x2f\xc9\xcf\x4e\xcd\x2b\x8e\x4f\x49\x2d\x49\xcc\xcc\x29\x06\x49\x24\x27\x26\x67\xa4\xa6\x40\x25\x94\xac\x2c\x2d\x6b\x6b\x75\x94\x92\x33\xf2\x33\x93\x53\x81\xdc\xe8\xd8\x5a\x00\xe1\x2d\x48\x6b\x45\x00\x00\x00";
+    const GZIP_SSE: &[u8] = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x4b\x49\x2c\x49\xb4\x52\xa8\x56\x2a\x2d\x4e\x4c\x4f\x55\xb2\xaa\x56\x2a\x28\xca\xcf\x2d\x28\x89\x2f\xc9\xcf\x4e\xcd\x2b\x8e\x4f\x49\x2d\x49\xcc\xcc\x29\x06\x49\x24\x27\x26\x67\xa4\xa6\x40\x25\x94\xac\x2c\x2d\x6b\x6b\x75\x94\x92\x33\xf2\x33\x93\x53\x81\xdc\xe8\xd8\x5a\x2e\xae\x14\xb0\x61\xd1\x2e\xfe\x7e\xae\xb1\x5c\x5c\x00\x62\x9a\xfc\x7a\x5b\x00\x00\x00";
+
+    async fn mock_encoded_decode_response(
+        status: StatusCode,
+        body: &'static [u8],
+        content_type: &'static str,
+        content_encoding: &'static str,
+    ) -> (reqwest::Response, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || async move {
+                (
+                    status,
+                    [
+                        ("content-type", content_type),
+                        ("content-encoding", content_encoding),
+                        ("retry-after", "7"),
+                        ("connection", "close"),
+                    ],
+                    body,
+                )
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .no_gzip()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        (response, server)
+    }
+
+    #[tokio::test]
+    async fn finalizer_preserves_gzip_passthrough_headers_and_body() {
+        let prefill = json!({"usage":{"prompt_tokens_details":{"cached_tokens":4}}});
+        for path in [
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/responses",
+            "/custom",
+        ] {
+            for status in [StatusCode::OK, StatusCode::TOO_MANY_REQUESTS] {
+                for is_streaming in [false, true] {
+                    for needs_logprobs in [false, true] {
+                        let streaming_success = is_streaming && status.is_success();
+                        let (raw, content_type) = if streaming_success {
+                            (GZIP_SSE, "text/event-stream")
+                        } else {
+                            (GZIP_JSON, "application/json")
+                        };
+                        let (decode, server) =
+                            mock_encoded_decode_response(status, raw, content_type, "gzip").await;
+                        let result = finalize_decode_response(
+                            decode,
+                            Some(&prefill),
+                            path,
+                            is_streaming,
+                            needs_logprobs,
+                        )
+                        .await;
+                        if status.is_success()
+                            && !is_streaming
+                            && needs_logprobs
+                            && !pd_cached_tokens::is_supported_path(path)
+                        {
+                            // Preserve the existing explicit logprobs parse-error path;
+                            // this fix does not add gzip decoding to JSON merging.
+                            assert!(result
+                                .unwrap_err()
+                                .contains("Failed to parse Decode response"));
+                        } else {
+                            let response = result.unwrap();
+                            assert_eq!(response.status(), status);
+                            assert_eq!(response.headers()["content-encoding"], "gzip");
+                            assert_eq!(response.headers()["content-type"], content_type);
+                            assert_eq!(response.headers()["retry-after"], "7");
+                            assert!(response.headers().get("connection").is_none());
+                            assert!(response.headers().get("content-length").is_none());
+                            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                                .await
+                                .unwrap();
+                            assert_eq!(bytes.as_ref(), raw, "path: {path}");
+                        }
+                        server.abort();
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn finalizer_preserves_encoded_sse_prefix_on_upstream_error() {
+        use futures_util::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Encoding: gzip\r\nContent-Encoding: identity\r\nContent-Length: {}\r\n\r\n",
+                GZIP_SSE.len() + 20
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            socket.write_all(GZIP_SSE).await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let decode = reqwest::Client::builder()
+            .no_proxy()
+            .no_gzip()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        let response = finalize_decode_response(decode, None, "/v1/completions", true, false)
+            .await
+            .unwrap();
+        let encodings: Vec<_> = response
+            .headers()
+            .get_all("content-encoding")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(encodings, ["gzip", "identity"]);
+        let mut stream = response.into_body().into_data_stream();
+        let mut received = Vec::new();
+        let mut read_failed = false;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => received.extend_from_slice(&bytes),
+                Err(_) => {
+                    read_failed = true;
+                    break;
+                }
+            }
+        }
+        assert!(read_failed);
+        assert_eq!(received, GZIP_SSE);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn finalizer_reconciles_identity_encoded_responses() {
+        let raw = b"data: {\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":99}},\"choices\":[]}\n\n";
+        let prefill = json!({"usage":{"prompt_tokens_details":{"cached_tokens":4}}});
+        let (decode, server) =
+            mock_encoded_decode_response(StatusCode::OK, raw, "text/event-stream", "identity")
+                .await;
+        let response =
+            finalize_decode_response(decode, Some(&prefill), "/v1/completions", true, false)
+                .await
+                .unwrap();
+        assert_eq!(response.headers()["content-encoding"], "identity");
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let result = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(result.contains("\"cached_tokens\":4"));
+        assert!(!result.contains("\"cached_tokens\":99"));
+        server.abort();
+
+        let (decode, server) = mock_encoded_decode_response(
+            StatusCode::OK,
+            br#"{"usage":{"prompt_tokens_details":{"cached_tokens":99}},"choices":[]}"#,
+            "application/json",
+            "identity",
+        )
+        .await;
+        let response =
+            finalize_decode_response(decode, Some(&prefill), "/v1/completions", false, false)
+                .await
+                .unwrap();
+        assert!(response.headers().get("content-encoding").is_none());
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result["usage"]["prompt_tokens_details"]["cached_tokens"], 4);
+        server.abort();
     }
 
     #[tokio::test]
