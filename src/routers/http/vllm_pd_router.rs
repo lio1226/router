@@ -2849,7 +2849,8 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0; 4096];
-            socket.read(&mut request).await.unwrap();
+            let bytes_read = socket.read(&mut request).await.unwrap();
+            assert!(bytes_read > 0, "client closed before sending request");
             let headers = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Encoding: gzip\r\nContent-Encoding: identity\r\nContent-Length: {}\r\n\r\n",
                 GZIP_SSE.len() + 20
@@ -3049,7 +3050,8 @@ mod tests {
                     let server = tokio::spawn(async move {
                         let (mut socket, _) = listener.accept().await.unwrap();
                         let mut request = [0; 4096];
-                        socket.read(&mut request).await.unwrap();
+                        let bytes_read = socket.read(&mut request).await.unwrap();
+                        assert!(bytes_read > 0, "client closed before sending request");
                         // Send fewer bytes than Content-Length promises, then close.
                         socket
                             .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 20\r\n\r\n{")
