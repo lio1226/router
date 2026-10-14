@@ -2872,6 +2872,53 @@ mod tests {
         (response, server)
     }
 
+    #[tokio::test]
+    async fn finalizer_closes_oversized_sse_after_preserving_status_and_prefix() {
+        use futures_util::StreamExt;
+
+        for path in ["/v1/chat/completions", "/v1/completions"] {
+            let prefix = b"data: {\"choices\":[{\"text\":\"ok\"}]}\n\n";
+            let oversized_frame_bytes = 1024 * 1024 + 1;
+            let mut raw = prefix.to_vec();
+            raw.extend_from_slice(b"data: ");
+            // Include the data field prefix and final blank line in the budget.
+            raw.resize(prefix.len() + oversized_frame_bytes - 2, b'x');
+            raw.extend_from_slice(b"\n\n");
+            assert_eq!(raw.len() - prefix.len(), oversized_frame_bytes);
+            raw.extend_from_slice(b"data: [DONE]\n\n");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::get(move || {
+                    let raw = raw.clone();
+                    async move { ([("content-type", "text/event-stream")], raw) }
+                }),
+            );
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let decode = reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .get(format!("http://{address}/"))
+                .send()
+                .await
+                .unwrap();
+            let response = finalize_decode_response(decode, None, path, true, false)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["content-type"], "text/event-stream");
+            let mut stream = response.into_body().into_data_stream();
+            assert_eq!(stream.next().await.unwrap().unwrap(), prefix.as_slice());
+            assert!(stream.next().await.unwrap().is_err());
+            assert!(stream.next().await.is_none());
+            server.abort();
+        }
+    }
+
     // Fixed gzip fixtures for a JSON usage body and an SSE usage/DONE stream.
     const GZIP_JSON: &[u8] = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xab\x56\x2a\x2d\x4e\x4c\x4f\x55\xb2\xaa\x56\x2a\x28\xca\xcf\x2d\x28\x89\x2f\xc9\xcf\x4e\xcd\x2b\x8e\x4f\x49\x2d\x49\xcc\xcc\x29\x06\x49\x24\x27\x26\x67\xa4\xa6\x40\x25\x94\xac\x2c\x2d\x6b\x6b\x75\x94\x92\x33\xf2\x33\x93\x53\x81\xdc\xe8\xd8\x5a\x00\xe1\x2d\x48\x6b\x45\x00\x00\x00";
     const GZIP_SSE: &[u8] = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x4b\x49\x2c\x49\xb4\x52\xa8\x56\x2a\x2d\x4e\x4c\x4f\x55\xb2\xaa\x56\x2a\x28\xca\xcf\x2d\x28\x89\x2f\xc9\xcf\x4e\xcd\x2b\x8e\x4f\x49\x2d\x49\xcc\xcc\x29\x06\x49\x24\x27\x26\x67\xa4\xa6\x40\x25\x94\xac\x2c\x2d\x6b\x6b\x75\x94\x92\x33\xf2\x33\x93\x53\x81\xdc\xe8\xd8\x5a\x2e\xae\x14\xb0\x61\xd1\x2e\xfe\x7e\xae\xb1\x5c\x5c\x00\x62\x9a\xfc\x7a\x5b\x00\x00\x00";
