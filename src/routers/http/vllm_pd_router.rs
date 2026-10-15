@@ -164,15 +164,21 @@ async fn finalize_decode_response(
         return response_with_body(status, &headers, body);
     }
 
-    // Read successful non-streaming responses completely before committing the
-    // status, even when their bodies do not need enrichment.
+    // Forward bodies that need no enrichment without waiting for or buffering
+    // the complete response, even when the API request is non-streaming.
+    if !reconcile_cache && !needs_logprobs {
+        return response_with_body(
+            status,
+            &headers,
+            Body::from_stream(decode_response.bytes_stream()),
+        );
+    }
+
+    // Cache reconciliation and logprobs merging require the complete JSON body.
     let original = decode_response
         .bytes()
         .await
         .map_err(|error| format!("Failed to read Decode response: {error}"))?;
-    if !reconcile_cache && !needs_logprobs {
-        return response_with_body(status, &headers, Body::from(original));
-    }
 
     let mut json: Value = match serde_json::from_slice(&original) {
         Ok(json) => json,
@@ -3214,7 +3220,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalizer_rejects_truncated_non_streaming_body_before_returning_response() {
+    async fn finalizer_forwards_unenriched_body_before_upstream_finishes() {
+        use futures_util::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{timeout, Duration};
+
+        for path in [
+            "/v1/responses",
+            "/generate",
+            "/inference/v1/generate",
+            "/custom",
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (finish, ready_to_finish) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let bytes_read = socket.read(&mut request).await.unwrap();
+                assert!(bytes_read > 0, "client closed before sending request");
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 12\r\n\r\nprefix")
+                    .await
+                    .unwrap();
+                // The response cannot finish until the client receives its prefix.
+                ready_to_finish.await.unwrap();
+                socket.write_all(b"suffix").await.unwrap();
+                socket.shutdown().await.unwrap();
+            });
+            let decode = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap()
+                .get(format!("http://{address}/"))
+                .send()
+                .await
+                .unwrap();
+            let response = timeout(
+                Duration::from_secs(2),
+                finalize_decode_response(decode, None, path, false, false),
+            )
+            .await
+            .expect("unenriched responses must not wait for the complete upstream body")
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()["content-type"],
+                "application/octet-stream"
+            );
+            let mut body = response.into_body().into_data_stream();
+            let mut prefix = Vec::new();
+            timeout(Duration::from_secs(2), async {
+                while prefix.len() < 6 {
+                    prefix.extend_from_slice(&body.next().await.unwrap().unwrap());
+                }
+            })
+            .await
+            .expect("upstream bytes must be forwarded before the body finishes");
+            assert_eq!(prefix, b"prefix");
+            finish.send(()).unwrap();
+            let mut suffix = Vec::new();
+            while let Some(chunk) = body.next().await {
+                suffix.extend_from_slice(&chunk.unwrap());
+            }
+            assert_eq!(suffix, b"suffix");
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn finalizer_reports_truncated_bodies_before_or_after_commit_as_required() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         for path in [
@@ -3251,7 +3327,9 @@ mod tests {
                     let result =
                         finalize_decode_response(decode, None, path, is_streaming, needs_logprobs)
                             .await;
-                    if is_streaming {
+                    let needs_enrichment =
+                        pd_cached_tokens::is_supported_path(path) || needs_logprobs;
+                    if is_streaming || !needs_enrichment {
                         let response = result.unwrap();
                         assert_eq!(response.status(), StatusCode::OK);
                         assert!(axum::body::to_bytes(response.into_body(), 1024)
