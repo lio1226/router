@@ -3,8 +3,12 @@
 use super::dp_utils;
 use super::logprobs_merge;
 use super::pd_cached_tokens;
+use super::pd_dispatch::{prefill_first, PdDispatchError, RequestMetrics};
+use super::pd_request_error::{
+    decode_stream, pd_error_description, InternalErrorReason, PdPhase, PdRequestError,
+};
 use super::pd_router::PdRouterBase;
-use super::pd_types::{error_chain, PDRouterError};
+use super::pd_types::PDRouterError;
 use super::usage_merge;
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
 use crate::config::KvConnector;
@@ -26,7 +30,6 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -75,6 +78,18 @@ pub struct VllmPDRouter {
 /// Transfer ID prefix used by MoRI-IO to correlate prefill and decode legs.
 /// Must match `MoRIIOConstants.TRANSFER_PREFIX` in the vLLM Python connector.
 const MORIIO_TRANSFER_PREFIX: &str = "tx";
+
+fn moriio_read_params(mut params: Value, dp_size: usize) -> Option<Value> {
+    // serde_json's old indexed assignment promoted null to an object. Keep
+    // that behavior, while avoiding a panic for other non-object values.
+    if params.is_null() {
+        params = json!({});
+    }
+    params
+        .as_object_mut()?
+        .insert("remote_dp_size".into(), json!(dp_size));
+    Some(params)
+}
 
 /// Prepare each routing representation once, only if a P/D policy consumes it.
 struct PolicyRequestText {
@@ -136,14 +151,14 @@ fn response_with_body(
     status: StatusCode,
     headers: &HeaderMap,
     body: Body,
-) -> Result<Response, String> {
+) -> Result<Response, PdRequestError> {
     let mut builder = Response::builder().status(status);
     for (name, value) in headers {
         builder = builder.header(name, value);
     }
     builder
         .body(body)
-        .map_err(|error| format!("Failed to build Decode response: {error}"))
+        .map_err(|_| PdRequestError::Internal(InternalErrorReason::BuildResponse))
 }
 
 /// Shared final response handling for direct/discovery and sequential/concurrent PD paths.
@@ -153,7 +168,7 @@ async fn finalize_decode_response(
     path: &str,
     is_streaming: bool,
     needs_logprobs: bool,
-) -> Result<Response, String> {
+) -> Result<Response, PdRequestError> {
     let status = decode_response.status();
     let mut headers = header_utils::preserve_response_headers(decode_response.headers());
     headers.remove(axum::http::header::CONTENT_LENGTH);
@@ -175,7 +190,7 @@ async fn finalize_decode_response(
         return response_with_body(
             status,
             &headers,
-            Body::from_stream(decode_response.bytes_stream()),
+            Body::from_stream(decode_stream(decode_response.bytes_stream())),
         );
     }
 
@@ -192,7 +207,7 @@ async fn finalize_decode_response(
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.split(';').next())
             .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"));
-        let stream = decode_response.bytes_stream();
+        let stream = decode_stream(decode_response.bytes_stream());
         // A streaming request can receive a non-SSE body. Rewrite only upstream
         // event streams whose bytes are already decoded; forward all others.
         let body = if reconcile_cache && is_sse && !is_encoded {
@@ -213,7 +228,7 @@ async fn finalize_decode_response(
         return response_with_body(
             status,
             &headers,
-            Body::from_stream(decode_response.bytes_stream()),
+            Body::from_stream(decode_stream(decode_response.bytes_stream())),
         );
     }
 
@@ -227,19 +242,23 @@ async fn finalize_decode_response(
         return response_with_body(
             status,
             &headers,
-            Body::from_stream(decode_response.bytes_stream()),
+            Body::from_stream(decode_stream(decode_response.bytes_stream())),
         );
     }
     let mut source = decode_response.bytes_stream();
     let mut original = Vec::new();
     while let Some(chunk) = source.next().await {
-        let chunk = chunk.map_err(|error| format!("Failed to read Decode response: {error}"))?;
+        let chunk = chunk.map_err(|error| PdRequestError::from_reqwest(PdPhase::Decode, error))?;
         if chunk.len() > MAX_JSON_REWRITE_BYTES - original.len() {
             let prefix = futures_util::stream::iter([
                 Ok::<_, reqwest::Error>(bytes::Bytes::from(original)),
                 Ok(chunk),
             ]);
-            return response_with_body(status, &headers, Body::from_stream(prefix.chain(source)));
+            return response_with_body(
+                status,
+                &headers,
+                Body::from_stream(decode_stream(prefix.chain(source))),
+            );
         }
         let needed = original.len() + chunk.len();
         if needed > original.capacity() {
@@ -258,16 +277,20 @@ async fn finalize_decode_response(
             warn!("Cannot parse successful PD Decode response for cached-token reconciliation: {error}");
             return response_with_body(status, &headers, Body::from(original));
         }
-        Err(error) => return Err(format!("Failed to parse Decode response as JSON: {error}")),
+        Err(_) => return Err(PdRequestError::protocol(PdPhase::Decode)),
     };
 
     let mut changed = false;
     if needs_logprobs {
         let empty_json = Value::Null;
-        changed |= logprobs_merge::merge_logprobs_in_json(
+        let merged = logprobs_merge::merge_logprobs_in_json(
             prefill_response_json.unwrap_or(&empty_json),
             &mut json,
         );
+        if merged {
+            debug!("Successfully merged logprobs from prefill and decode responses");
+        }
+        changed |= merged;
     }
     if reconcile_cache {
         if let Some(prefill) = prefill_response_json {
@@ -282,7 +305,7 @@ async fn finalize_decode_response(
     if changed {
         drop(original);
         let encoded = serde_json::to_vec(&json)
-            .map_err(|error| format!("Failed to serialize Decode response: {error}"))?;
+            .map_err(|_| PdRequestError::Internal(InternalErrorReason::SerializeResponse))?;
         headers.remove(axum::http::header::CONTENT_ENCODING);
         response_with_body(status, &headers, Body::from(encoded))
     } else {
@@ -524,9 +547,10 @@ impl VllmPDRouter {
                     Some(params)
                 } else {
                     // READ mode: extract params from prefill response and inject remote_dp_size.
-                    let mut params = prefill_response_json?.get("kv_transfer_params")?.clone();
-                    params["remote_dp_size"] = json!(self.intra_node_data_parallel_size);
-                    Some(params)
+                    moriio_read_params(
+                        prefill_response_json?.get("kv_transfer_params")?.clone(),
+                        self.intra_node_data_parallel_size,
+                    )
                 }
             }
             KvConnector::Nixl => {
@@ -964,11 +988,7 @@ impl VllmPDRouter {
             }
             Err(e) => {
                 error!("Two-stage processing failed: {}", e);
-                (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Request processing failed: {}", e),
-                )
-                    .into_response()
+                e.into_response()
             }
         }
     }
@@ -984,27 +1004,24 @@ impl VllmPDRouter {
         path: &str,
         prefill_http: &str,
         decode_http: &str,
-        decode_base_http: &str,
-        start_time: Instant,
+        decode_base_url: &str,
         is_streaming: bool,
         needs_logprobs: bool,
-    ) -> Result<Response, String> {
+        request_metrics: &mut RequestMetrics<'_>,
+    ) -> Result<Response, PdDispatchError> {
         debug!(
             "Decode server responded with status: {}",
             decode_response.status()
         );
 
-        self.stop_profiling(&format!("http://{}", decode_base_http))
-            .await;
-
-        let duration = start_time.elapsed();
-        RouterMetrics::record_pd_request(path);
-        RouterMetrics::record_pd_request_duration(path, duration);
+        self.stop_profiling(decode_base_url).await;
+        request_metrics.record();
         RouterMetrics::record_pd_prefill_request(prefill_http);
         RouterMetrics::record_pd_decode_request(decode_http);
 
         if !decode_response.status().is_success() {
             RouterMetrics::record_pd_decode_error(decode_http);
+            return Err(PdDispatchError::http(PdPhase::Decode, decode_response));
         }
 
         finalize_decode_response(
@@ -1015,9 +1032,57 @@ impl VllmPDRouter {
             needs_logprobs,
         )
         .await
+        .map_err(Into::into)
     }
 
-    /// Two-stage request processing for vLLM disaggregated mode using discovered endpoints
+    /// Preserve direct sequential observation boundaries before finalizing the body.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_direct_decode_response(
+        &self,
+        decode_response: reqwest::Response,
+        prefill_response_json: &Value,
+        path: &str,
+        prefill_base_url: &str,
+        decode_base_url: &str,
+        is_streaming: bool,
+        needs_logprobs: bool,
+        request_metrics: &mut RequestMetrics<'_>,
+    ) -> Result<Response, PdDispatchError> {
+        request_metrics.record();
+        RouterMetrics::record_pd_prefill_request(prefill_base_url);
+        RouterMetrics::record_pd_decode_request(decode_base_url);
+
+        info!("📥 Decode response status: {}", decode_response.status());
+        if decode_response.status().is_success() {
+            info!(
+                "📥 Decode response headers: {:?}",
+                decode_response.headers()
+            );
+        } else {
+            info!(
+                header_count = decode_response.headers().len(),
+                "📥 Decode response headers omitted for non-success response"
+            );
+        }
+
+        if !decode_response.status().is_success() {
+            RouterMetrics::record_pd_decode_error(decode_base_url);
+            return Err(PdDispatchError::http(PdPhase::Decode, decode_response));
+        }
+
+        finalize_decode_response(
+            decode_response,
+            Some(prefill_response_json),
+            path,
+            is_streaming,
+            needs_logprobs,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    // Keep the legacy worker-labelled phase counters at their original exits.
+    // Encoder/input responses bypass this error type and remain unaffected.
     async fn process_vllm_two_stage_request_discovered(
         &self,
         request_json: Value,
@@ -1025,12 +1090,41 @@ impl VllmPDRouter {
         decode_instance: &(String, String),
         path: &str,
         headers: Option<&HeaderMap>,
-    ) -> Result<Response, String> {
+    ) -> Result<Response, PdRequestError> {
+        let mut request_metrics = RequestMetrics::new(path);
+        let result = self
+            .process_vllm_two_stage_request_discovered_inner(
+                request_json,
+                prefill_instance,
+                decode_instance,
+                path,
+                headers,
+                &mut request_metrics,
+            )
+            .await;
+        match result {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                request_metrics.record_failure(&error, &prefill_instance.0, &decode_instance.0);
+                Err(error.resolve().await)
+            }
+        }
+    }
+
+    /// Two-stage request processing for vLLM disaggregated mode using discovered endpoints
+    async fn process_vllm_two_stage_request_discovered_inner(
+        &self,
+        request_json: Value,
+        prefill_instance: &(String, String),
+        decode_instance: &(String, String),
+        path: &str,
+        headers: Option<&HeaderMap>,
+        request_metrics: &mut RequestMetrics<'_>,
+    ) -> Result<Response, PdDispatchError> {
         let (prefill_http, prefill_zmq) = prefill_instance;
         let (decode_http, decode_zmq) = decode_instance;
 
         debug!("ENTERED process_vllm_two_stage_request_discovered method");
-        let start_time = Instant::now();
         debug!(
             "Prefill: HTTP={}, ZMQ={}, Decode: HTTP={}, ZMQ={}, Path: {}",
             prefill_http, prefill_zmq, decode_http, decode_zmq, path
@@ -1061,11 +1155,15 @@ impl VllmPDRouter {
         }
 
         // Add kv_transfer_params for KV connector support at top level
-        prefill_request["kv_transfer_params"] = self.build_prefill_kv_transfer_params(
-            transfer_id.as_deref(),
-            Some(&decode_base_http),
-            prefill_dp_rank,
-        )?;
+        prefill_request["kv_transfer_params"] = self
+            .build_prefill_kv_transfer_params(
+                transfer_id.as_deref(),
+                Some(&decode_base_http),
+                prefill_dp_rank,
+            )
+            .map_err(|_| {
+                PdRequestError::Internal(InternalErrorReason::MoriIoTransferModeMissing)
+            })?;
 
         debug!(
             "Added kv_transfer_params to prefill request for {:?} connector",
@@ -1094,13 +1192,13 @@ impl VllmPDRouter {
             .unwrap_or(false);
 
         let prefill_request_str = serde_json::to_string(&prefill_request)
-            .map_err(|e| format!("Failed to serialize prefill request: {}", e))?;
+            .map_err(|_| PdRequestError::Internal(InternalErrorReason::SerializePrefillRequest))?;
 
         let prefill_request_url = format!("http://{}{}", prefill_base_http, path);
 
         // Stage 1: dispatch prefill.
         // Sequential mode: send now and await — decode kv_transfer_params come from the prefill response.
-        // Concurrent mode: skip; prefill is sent concurrently with decode in Stage 2 via tokio::join!.
+        // Concurrent mode: both sends start in Stage 2 behind the Prefill gate.
         let prefill_response_json: Option<Value> = if is_concurrent_dispatch {
             None
         } else {
@@ -1111,7 +1209,7 @@ impl VllmPDRouter {
             self.start_profiling(&format!("http://{}", prefill_base_http))
                 .await;
 
-            let prefill_response = match otel_http::send_client_request(
+            let prefill_response = match otel_http::prepare_client_request(
                 build_prefill_request_builder(
                     &self.http_client,
                     &prefill_request_url,
@@ -1127,55 +1225,49 @@ impl VllmPDRouter {
                     request_phase: Some("prefill"),
                 },
             )
+            .with_error_description(pd_error_description)
+            .send()
             .await
             {
                 Ok(resp) => resp,
                 Err(e) => {
-                    let full_error = error_chain(&e);
-                    let duration = start_time.elapsed();
-                    RouterMetrics::record_pd_prefill_error(prefill_http);
-                    RouterMetrics::record_pd_request(path);
-                    RouterMetrics::record_pd_request_duration(path, duration);
-                    return Err(format!(
-                        "Prefill request failed to {}: {}",
-                        prefill_http, full_error
-                    ));
+                    let error = PdRequestError::from_reqwest(PdPhase::Prefill, e).into();
+                    request_metrics.record_failure(&error, prefill_http, decode_http);
+                    self.stop_profiling(&format!("http://{}", prefill_base_http))
+                        .await;
+                    return Err(error);
                 }
             };
 
-            let prefill_status = prefill_response.status();
-            debug!("Prefill server responded with status: {}", prefill_status);
-
-            if !prefill_status.is_success() {
-                let duration = start_time.elapsed();
-                RouterMetrics::record_pd_prefill_error(prefill_http);
-                RouterMetrics::record_pd_request(path);
-                RouterMetrics::record_pd_request_duration(path, duration);
-                let error_body = prefill_response.text().await.unwrap_or_default();
-                return Err(format!(
-                    "Prefill server error {}: {}",
-                    prefill_status, error_body
-                ));
+            let successful_headers = prefill_response.status().is_success();
+            let result: Result<_, PdDispatchError> = async {
+                debug!(
+                    "Prefill server responded with status: {}",
+                    prefill_response.status()
+                );
+                if !prefill_response.status().is_success() {
+                    let error = PdDispatchError::http(PdPhase::Prefill, prefill_response);
+                    request_metrics.record_failure(&error, prefill_http, decode_http);
+                    return Err(error);
+                }
+                let bytes = prefill_response
+                    .bytes()
+                    .await
+                    .map_err(|e| PdRequestError::from_reqwest(PdPhase::Prefill, e))?;
+                let json = serde_json::from_slice::<Value>(&bytes)
+                    .map_err(|_| PdRequestError::protocol(PdPhase::Prefill))?;
+                debug!("Prefill response body: {}", String::from_utf8_lossy(&bytes));
+                Ok(json)
             }
-
-            // Extract kv_transfer_params from prefill response
-            let prefill_response_text = prefill_response.text().await.map_err(|e| {
-                let full_error = error_chain(&e);
-                format!(
-                    "Failed to read prefill response from {}: {}",
-                    prefill_http, full_error
-                )
-            })?;
-
-            debug!("Prefill response body: {}", prefill_response_text);
-
-            let prefill_json: Value = serde_json::from_str(&prefill_response_text)
-                .map_err(|e| format!("Failed to parse prefill response as JSON: {}", e))?;
-
-            // Stop profiling on prefill server once we have its response.
+            .await;
             self.stop_profiling(&format!("http://{}", prefill_base_http))
                 .await;
-
+            if successful_headers && result.is_err() {
+                // Discovery's old body-read/JSON `?` exits did not record
+                // legacy request/worker counters, unlike direct mode.
+                request_metrics.exclude_legacy_error();
+            }
+            let prefill_json = result?;
             Some(prefill_json)
         };
 
@@ -1196,10 +1288,15 @@ impl VllmPDRouter {
                 "Added kv_transfer_params to decode request for {:?} connector",
                 self.kv_connector
             );
+        } else {
+            warn!(
+                "No kv_transfer_params for prefill {}, decode will proceed without them",
+                prefill_http
+            );
         }
 
         let decode_request_str = serde_json::to_string(&decode_request)
-            .map_err(|e| format!("Failed to serialize decode request: {}", e))?;
+            .map_err(|_| PdRequestError::Internal(InternalErrorReason::SerializeDecodeRequest))?;
 
         // Stage 2: Send to decode server with original request and same P2P coordination header
         debug!(
@@ -1234,23 +1331,14 @@ impl VllmPDRouter {
 
         let decode_request_url = format!("http://{}{}", decode_base_http, path);
 
-        // Concurrent dispatch: run prefill and decode concurrently via tokio::join! so the prefill
-        // task is always guaranteed to execute (unlike fire-and-forget tokio::spawn, which
-        // can be silently dropped under load) and both HTTP sends start at the same time.
         if is_concurrent_dispatch {
             self.start_profiling(&format!("http://{}", prefill_base_http))
                 .await;
-            // Capture references rather than clones — tokio::join! polls both futures on the
-            // same task so they don't need to be Send, and local borrows are valid for the
-            // duration of the join.
-            let http_client = &self.http_client;
-            let enable_profiling = self.enable_profiling;
-            let profiling_tasks = &self.profiling_tasks;
-            let pd_router = &self.pd_router;
-            let prefill_fut = async move {
-                let result = otel_http::send_client_request(
+            let mut prefill_profile_stopped = false;
+            let prefill_fut = async {
+                let sent = otel_http::prepare_client_request(
                     build_prefill_request_builder(
-                        http_client,
+                        &self.http_client,
                         &prefill_request_url,
                         &request_id,
                         prefill_dp_rank,
@@ -1264,50 +1352,39 @@ impl VllmPDRouter {
                         request_phase: Some("prefill"),
                     },
                 )
+                .with_error_description(pd_error_description)
+                .send()
                 .await;
-                if enable_profiling {
-                    let worker_url = format!("http://{}", prefill_base_http);
-                    let mut tasks = profiling_tasks.lock().await;
-                    if let Some(handle) = tasks.remove(&worker_url) {
-                        handle.abort();
-                    }
-                    pd_router.stop_profiling(&worker_url).await;
+                // Discovery has always stopped P at its own response headers,
+                // independently of D and before reading the P response body.
+                let response =
+                    sent.map_err(|e| PdRequestError::from_reqwest(PdPhase::Prefill, e))?;
+                let status = response.status();
+                if !response.status().is_success() {
+                    return Err(PdDispatchError::http(PdPhase::Prefill, response));
                 }
-                match result {
-                    Ok(resp) if resp.status().is_success() => {
-                        let status = resp.status();
-                        match resp.bytes().await {
-                            Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
-                                Ok(json) => {
-                                    debug!("Concurrent prefill completed with status {}", status);
-                                    Ok(Some(json))
-                                }
-                                Err(_) => {
-                                    debug!(
-                                        "Concurrent prefill completed with status {} (non-JSON body)",
-                                        status
-                                    );
-                                    Ok(None)
-                                }
-                            },
-                            Err(e) => {
-                                warn!("Concurrent prefill: failed to read response body: {}", e);
-                                Ok(None)
-                            }
-                        }
-                    }
-                    Ok(resp) => {
-                        let status = resp.status();
-                        warn!("Concurrent prefill returned non-2xx status: {}", status);
-                        Err(format!("Prefill request failed with status {}", status))
-                    }
-                    Err(e) => {
-                        warn!("Concurrent prefill request failed: {}", e);
-                        Err(format!("Prefill request failed: {}", e))
-                    }
+                self.stop_profiling(&format!("http://{}", prefill_base_http))
+                    .await;
+                prefill_profile_stopped = true;
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|e| PdRequestError::from_reqwest(PdPhase::Prefill, e))?;
+                let json = serde_json::from_slice::<Value>(&bytes).ok();
+                if json.is_some() {
+                    debug!("Concurrent prefill completed with status {}", status);
+                } else {
+                    debug!(
+                        "Concurrent prefill completed with status {} (non-JSON body)",
+                        status
+                    );
                 }
+                if let Some(json) = json.as_ref() {
+                    self.maybe_cache_nixl_push_identity(&prefill_url_key, prefill_dp_rank, json);
+                }
+                Ok(json)
             };
-            let decode_fut = otel_http::send_client_request(
+            let decode_fut = otel_http::prepare_client_request(
                 decode_request_builder.body(decode_request_str),
                 headers,
                 ClientRequestOptions {
@@ -1316,64 +1393,39 @@ impl VllmPDRouter {
                     route: Some(path),
                     request_phase: Some("decode"),
                 },
-            );
-            let (prefill_result, decode_result) = tokio::join!(prefill_fut, decode_fut);
-            let concurrent_prefill_response_json: Option<Value> = match prefill_result {
-                Err(prefill_err) => {
-                    self.stop_profiling(&format!("http://{}", decode_base_http))
+            )
+            .with_error_description(pd_error_description)
+            .send();
+            let result = prefill_first(prefill_fut, decode_fut).await;
+            if let Err(error) = &result {
+                request_metrics.record_failure(error, prefill_http, decode_http);
+                if !prefill_profile_stopped {
+                    self.stop_profiling(&format!("http://{}", prefill_base_http))
                         .await;
-                    let duration = start_time.elapsed();
-                    RouterMetrics::record_pd_prefill_error(prefill_http);
-                    RouterMetrics::record_pd_request(path);
-                    RouterMetrics::record_pd_request_duration(path, duration);
-                    RouterMetrics::record_pd_prefill_request(prefill_http);
-                    return Err(format!(
-                        "Prefill request failed to {}: {}",
-                        prefill_http, prefill_err
-                    ));
                 }
-                Ok(json) => json,
-            };
-            if let Some(prefill_json) = concurrent_prefill_response_json.as_ref() {
-                self.maybe_cache_nixl_push_identity(
-                    &prefill_url_key,
-                    prefill_dp_rank,
-                    prefill_json,
-                );
+                self.stop_profiling(&format!("http://{}", decode_base_http))
+                    .await;
+                // Discovery concurrent mode counted P for either P failure
+                // or a decode send failure, before entering the handler.
+                RouterMetrics::record_pd_prefill_request(prefill_http);
             }
-            let decode_response = match decode_result {
-                Ok(resp) => resp,
-                Err(e) => {
-                    self.stop_profiling(&format!("http://{}", decode_base_http))
-                        .await;
-                    let full_error = error_chain(&e);
-                    let duration = start_time.elapsed();
-                    RouterMetrics::record_pd_decode_error(decode_http);
-                    RouterMetrics::record_pd_request(path);
-                    RouterMetrics::record_pd_request_duration(path, duration);
-                    RouterMetrics::record_pd_prefill_request(prefill_http);
-                    return Err(format!(
-                        "Decode request failed to {}: {}",
-                        decode_http, full_error
-                    ));
-                }
-            };
+            let (prefill_json, decode_response) = result?;
             return self
                 .handle_decode_response(
                     decode_response,
-                    concurrent_prefill_response_json.as_ref(),
+                    prefill_json.as_ref(),
                     path,
                     prefill_http,
                     decode_http,
-                    &decode_base_http,
-                    start_time,
+                    &format!("http://{}", decode_base_http),
                     is_streaming,
                     needs_logprobs,
+                    request_metrics,
                 )
                 .await;
         }
 
-        let decode_response = match otel_http::send_client_request(
+        let decode_response = match otel_http::prepare_client_request(
             decode_request_builder.body(decode_request_str),
             headers,
             ClientRequestOptions {
@@ -1383,20 +1435,18 @@ impl VllmPDRouter {
                 request_phase: Some("decode"),
             },
         )
+        .with_error_description(pd_error_description)
+        .send()
         .await
         {
             Ok(resp) => resp,
             Err(e) => {
-                let full_error = error_chain(&e);
-                let duration = start_time.elapsed();
-                RouterMetrics::record_pd_decode_error(decode_http);
-                RouterMetrics::record_pd_request(path);
-                RouterMetrics::record_pd_request_duration(path, duration);
+                let error = PdRequestError::from_reqwest(PdPhase::Decode, e).into();
+                request_metrics.record_failure(&error, prefill_http, decode_http);
                 RouterMetrics::record_pd_prefill_request(prefill_http);
-                return Err(format!(
-                    "Decode request failed to {}: {}",
-                    decode_http, full_error
-                ));
+                self.stop_profiling(&format!("http://{}", decode_base_http))
+                    .await;
+                return Err(error);
             }
         };
 
@@ -1406,29 +1456,65 @@ impl VllmPDRouter {
             path,
             prefill_http,
             decode_http,
-            &decode_base_http,
-            start_time,
+            &format!("http://{}", decode_base_http),
             is_streaming,
             needs_logprobs,
+            request_metrics,
         )
         .await
     }
 
+    async fn process_vllm_two_stage_request(
+        &self,
+        request_json: Value,
+        prefill_worker: Arc<dyn Worker>,
+        decode_worker: Arc<dyn Worker>,
+        path: &str,
+        headers: Option<&HeaderMap>,
+        decode_load: WorkerLoadGuard<'_>,
+    ) -> Result<Response, PdRequestError> {
+        let mut request_metrics = RequestMetrics::new(path);
+        let result = self
+            .process_vllm_two_stage_request_inner(
+                request_json,
+                prefill_worker.clone(),
+                decode_worker.clone(),
+                path,
+                headers,
+                &mut request_metrics,
+            )
+            .await;
+        // The selected Decode stays reserved during dispatch, including Prefill
+        // and buffered success processing. Release it before deferred error capture.
+        drop(decode_load);
+        match result {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                request_metrics.record_failure(
+                    &error,
+                    prefill_worker.base_url(),
+                    decode_worker.base_url(),
+                );
+                Err(error.resolve().await)
+            }
+        }
+    }
+
     /// Two-stage request processing for vLLM disaggregated mode
     ///
-    /// Prefill load is tracked during the prefill phase. The static route caller
-    /// holds the selected decode reservation across this future, including prefill.
-    /// Streaming response-body load tracking is separate from this dispatch scope.
-    async fn process_vllm_two_stage_request(
+    /// Prefill load is tracked during its phase. The outer request handler holds
+    /// the selected Decode reservation across dispatch, including Prefill.
+    /// Streaming response-body load tracking is separate from this scope.
+    async fn process_vllm_two_stage_request_inner(
         &self,
         original_request: Value,
         prefill_worker: Arc<dyn Worker>,
         decode_worker: Arc<dyn Worker>,
         path: &str,
         headers: Option<&HeaderMap>,
-    ) -> Result<Response, PDRouterError> {
+        request_metrics: &mut RequestMetrics<'_>,
+    ) -> Result<Response, PdDispatchError> {
         debug!("ENTERED process_vllm_two_stage_request method");
-        let start_time = Instant::now();
         if !original_request.is_object() {
             return Ok((
                 StatusCode::BAD_REQUEST,
@@ -1476,8 +1562,8 @@ impl VllmPDRouter {
                     request_id,
                     path,
                     headers,
-                    start_time,
                     ec_transfers,
+                    request_metrics,
                 )
                 .await;
         }
@@ -1490,7 +1576,7 @@ impl VllmPDRouter {
         );
 
         // Increment prefill load at the start of the prefill phase
-        prefill_worker.increment_load();
+        let prefill_load = WorkerLoadGuard::new(prefill_worker.as_ref());
 
         let prefill_zmq_addr =
             self.get_zmq_address(prefill_worker.base_url(), ServiceType::Prefill);
@@ -1520,7 +1606,9 @@ impl VllmPDRouter {
                 Some(&decode_base_url),
                 decode_worker.dp_rank(),
             )
-            .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
+            .map_err(|_| {
+                PdRequestError::Internal(InternalErrorReason::MoriIoTransferModeMissing)
+            })?;
 
         debug!(
             "Added kv_transfer_params to prefill request for {:?} connector",
@@ -1545,12 +1633,12 @@ impl VllmPDRouter {
                 request_id
             );
         }
+
+        // Start profiling on prefill server
         debug!(
             "📤 Prefill request payload: {}",
             serde_json::to_string_pretty(&prefill_request).unwrap_or_default()
         );
-
-        // Start profiling on prefill server
         self.start_profiling(&prefill_base_url).await;
 
         let mut prefill_request_builder = self
@@ -1571,7 +1659,7 @@ impl VllmPDRouter {
         prefill_request_builder =
             dp_utils::add_dp_rank_header(prefill_request_builder, prefill_dp_rank);
 
-        let prefill_response = match otel_http::send_client_request(
+        let prefill_response = match otel_http::prepare_client_request(
             prefill_request_builder.json(&prefill_request),
             headers,
             ClientRequestOptions {
@@ -1581,97 +1669,64 @@ impl VllmPDRouter {
                 request_phase: Some("prefill"),
             },
         )
+        .with_error_description(pd_error_description)
+        .send()
         .await
         {
             Ok(resp) => resp,
             Err(e) => {
-                prefill_worker.decrement_load();
-                let full_error = error_chain(&e);
-                let duration = start_time.elapsed();
-                RouterMetrics::record_pd_prefill_error(&prefill_base_url);
-                RouterMetrics::record_pd_request(path);
-                RouterMetrics::record_pd_request_duration(path, duration);
-                return Err(PDRouterError::NetworkError {
-                    message: format!("Prefill request failed to {}: {}", prefill_url, full_error),
-                });
+                let error = PdRequestError::from_reqwest(PdPhase::Prefill, e).into();
+                drop(prefill_load);
+                request_metrics.record_failure(&error, &prefill_base_url, &decode_base_url);
+                self.stop_profiling(&prefill_base_url).await;
+                return Err(error);
             }
         };
 
         debug!("📥 Prefill response status: {}", prefill_response.status());
-        debug!(
-            "📥 Prefill response headers: {:?}",
-            prefill_response.headers()
-        );
-
-        if !prefill_response.status().is_success() {
-            prefill_worker.decrement_load();
-            let status = prefill_response.status();
-            let content_type = prefill_response
-                .headers()
-                .get(http::header::CONTENT_TYPE)
-                .cloned();
-            let detail = prefill_response.text().await.unwrap_or_default();
-            self.stop_profiling(&prefill_base_url).await;
-            let duration = start_time.elapsed();
-            RouterMetrics::record_pd_prefill_error(&prefill_base_url);
-            RouterMetrics::record_pd_request(path);
-            RouterMetrics::record_pd_request_duration(path, duration);
-            if status.is_client_error() {
-                let mut response = (status, detail).into_response();
-                if let Some(content_type) = content_type {
-                    response
-                        .headers_mut()
-                        .insert(http::header::CONTENT_TYPE, content_type);
-                }
-                return Ok(response);
-            }
-            return Err(PDRouterError::NetworkError {
-                message: format!("Prefill server {prefill_url} returned {status}: {detail}"),
-            });
-        }
-
-        // Extract prefill response body to get kv_transfer_params
-        let prefill_bytes = match prefill_response.bytes().await {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                prefill_worker.decrement_load();
-                let full_error = error_chain(&e);
-                let duration = start_time.elapsed();
-                RouterMetrics::record_pd_prefill_error(&prefill_base_url);
-                RouterMetrics::record_pd_request(path);
-                RouterMetrics::record_pd_request_duration(path, duration);
-                return Err(PDRouterError::NetworkError {
-                    message: format!(
-                        "Failed to read prefill response from {}: {}",
-                        prefill_url, full_error
-                    ),
-                });
-            }
-        };
-
-        debug!(
-            "📥 Prefill response body size: {} bytes",
-            prefill_bytes.len()
-        );
-        if prefill_bytes.len() < 1024 {
+        if prefill_response.status().is_success() {
             debug!(
-                "📥 Prefill response body content: {}",
-                String::from_utf8_lossy(&prefill_bytes)
+                "📥 Prefill response headers: {:?}",
+                prefill_response.headers()
+            );
+        } else {
+            debug!(
+                header_count = prefill_response.headers().len(),
+                "📥 Prefill response headers omitted for non-success response"
             );
         }
-
-        // Parse prefill response to extract kv_transfer_params
-        let prefill_response_json: Value = match serde_json::from_slice(&prefill_bytes) {
-            Ok(json) => json,
-            Err(e) => {
-                prefill_worker.decrement_load();
-                let duration = start_time.elapsed();
-                RouterMetrics::record_pd_prefill_error(&prefill_base_url);
-                RouterMetrics::record_pd_request(path);
-                RouterMetrics::record_pd_request_duration(path, duration);
-                return Err(PDRouterError::NetworkError {
-                    message: format!("Failed to parse prefill response as JSON: {}", e),
-                });
+        if !prefill_response.status().is_success() {
+            // Direct sequential HTTP errors record after body capture and
+            // profiling cleanup, unlike the body-read/JSON failures below.
+            drop(prefill_load);
+            let error = PdDispatchError::http(PdPhase::Prefill, prefill_response)
+                .resolve()
+                .await
+                .into();
+            self.stop_profiling(&prefill_base_url).await;
+            request_metrics.record_failure(&error, &prefill_base_url, &decode_base_url);
+            return Err(error);
+        }
+        let prefill_result: Result<_, PdRequestError> = async {
+            let bytes = prefill_response
+                .bytes()
+                .await
+                .map_err(|e| PdRequestError::from_reqwest(PdPhase::Prefill, e))?;
+            debug!("📥 Prefill response body size: {} bytes", bytes.len());
+            let json = serde_json::from_slice::<Value>(&bytes)
+                .map_err(|_| PdRequestError::protocol(PdPhase::Prefill))?;
+            Ok((json, bytes))
+        }
+        .await;
+        let (prefill_response_json, prefill_bytes) = match prefill_result {
+            Ok(result) => result,
+            Err(error) => {
+                let error = error.into();
+                // Preserve the legacy failure boundary before cleanup can await.
+                drop(prefill_load);
+                request_metrics.record_failure(&error, &prefill_base_url, &decode_base_url);
+                self.stop_profiling(&prefill_base_url).await;
+                return Err(error);
             }
         };
 
@@ -1682,31 +1737,26 @@ impl VllmPDRouter {
                 .get("kv_transfer_params")
                 .is_some_and(Value::is_object)
         {
-            prefill_worker.decrement_load();
+            drop(prefill_load);
             self.stop_profiling(&prefill_base_url).await;
-            let duration = start_time.elapsed();
-            RouterMetrics::record_pd_prefill_error(&prefill_base_url);
-            RouterMetrics::record_pd_request(path);
-            RouterMetrics::record_pd_request_duration(path, duration);
-            return Err(PDRouterError::NetworkError {
-                message:
-                    "Prefill returned no KV transfer parameters; refusing metadata-only decode"
-                        .into(),
-            });
+            return Err(PdRequestError::protocol(PdPhase::Prefill).into());
         }
 
-        // Prefill succeeded and consumed the embeddings; the pending EC
-        // transfers are now owned by the decode phase, so disarm the
-        // cancel-on-abandon guard.
+        if prefill_bytes.len() < 1024 {
+            debug!(
+                "📥 Prefill response body content: {}",
+                String::from_utf8_lossy(&prefill_bytes)
+            );
+        }
+        drop(prefill_bytes);
+
+        // Prefill consumed the embeddings; retain the existing EC ownership
+        // and worker-load transition before preparing the decode request.
         if let Some(transfers) = ec_transfers.as_mut() {
             transfers.disarm();
         }
-
-        // Stop profiling on prefill server after its work is done
         self.stop_profiling(&prefill_base_url).await;
-
-        // Prefill is complete; the caller still holds the decode reservation.
-        prefill_worker.decrement_load();
+        drop(prefill_load);
 
         debug!("✅ vLLM Stage 1 completed, starting Stage 2 - Decode");
 
@@ -1754,12 +1804,12 @@ impl VllmPDRouter {
                 request_id
             );
         }
+
+        // Start profiling on decode server
         debug!(
             "📤 Decode request payload: {}",
             serde_json::to_string_pretty(&decode_request).unwrap_or_default()
         );
-
-        // Start profiling on decode server
         self.start_profiling(&decode_base_url).await;
 
         let mut decode_request_builder = self
@@ -1780,7 +1830,7 @@ impl VllmPDRouter {
         decode_request_builder =
             dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
 
-        let decode_response = match otel_http::send_client_request(
+        let decode_response = match otel_http::prepare_client_request(
             decode_request_builder.json(&decode_request),
             headers,
             ClientRequestOptions {
@@ -1790,62 +1840,42 @@ impl VllmPDRouter {
                 request_phase: Some("decode"),
             },
         )
+        .with_error_description(pd_error_description)
+        .send()
         .await
         {
             Ok(resp) => resp,
             Err(e) => {
-                let full_error = error_chain(&e);
-                let duration = start_time.elapsed();
-                RouterMetrics::record_pd_decode_error(&decode_base_url);
-                RouterMetrics::record_pd_request(path);
-                RouterMetrics::record_pd_request_duration(path, duration);
+                let error = PdRequestError::from_reqwest(PdPhase::Decode, e).into();
+                request_metrics.record_failure(&error, &prefill_base_url, &decode_base_url);
                 RouterMetrics::record_pd_prefill_request(&prefill_base_url);
-                return Err(PDRouterError::NetworkError {
-                    message: format!("Decode request failed to {}: {}", decode_url, full_error),
-                });
+                self.stop_profiling(&decode_base_url).await;
+                return Err(error);
             }
         };
 
-        // Stop profiling on decode server after response received
+        // Keep profiling at response headers; the outer handler owns the reservation.
         self.stop_profiling(&decode_base_url).await;
-
-        let status = decode_response.status();
-        let headers = header_utils::preserve_response_headers(decode_response.headers());
-
-        info!("📥 Decode response status: {}", status);
-        info!("📥 Decode response headers: {:?}", headers);
-
-        // Record PD metrics
-        let duration = start_time.elapsed();
-        RouterMetrics::record_pd_request(path);
-        RouterMetrics::record_pd_request_duration(path, duration);
-        RouterMetrics::record_pd_prefill_request(&prefill_base_url);
-        RouterMetrics::record_pd_decode_request(&decode_base_url);
-
-        if !status.is_success() {
-            RouterMetrics::record_pd_decode_error(&decode_base_url);
-        }
-
-        // Check if logprobs merging is needed
         let needs_logprobs = original_request.get("logprobs").is_some()
             || original_request
                 .get("echo")
-                .and_then(|v| v.as_bool())
+                .and_then(Value::as_bool)
                 .unwrap_or(false);
         let is_streaming = original_request
             .get("stream")
-            .and_then(|v| v.as_bool())
+            .and_then(Value::as_bool)
             .unwrap_or(false);
-
-        finalize_decode_response(
+        self.handle_direct_decode_response(
             decode_response,
-            Some(&prefill_response_json),
+            &prefill_response_json,
             path,
+            &prefill_base_url,
+            &decode_base_url,
             is_streaming,
             needs_logprobs,
+            request_metrics,
         )
         .await
-        .map_err(|message| PDRouterError::NetworkError { message })
     }
 
     async fn try_build_concurrent_requests(
@@ -1897,9 +1927,9 @@ impl VllmPDRouter {
         request_id: String,
         path: &str,
         headers: Option<&HeaderMap>,
-        start_time: Instant,
         mut ec_transfers: Option<super::epd::EcTransferGuard>,
-    ) -> Result<Response, PDRouterError> {
+        request_metrics: &mut RequestMetrics<'_>,
+    ) -> Result<Response, PdDispatchError> {
         let prefill_base_url = prefill_worker.base_url().to_string();
         let prefill_dp_rank = prefill_worker.dp_rank();
         let decode_base_url = decode_worker.base_url().to_string();
@@ -1922,12 +1952,14 @@ impl VllmPDRouter {
             )
         };
 
-        prefill_worker.increment_load();
+        let mut prefill_load = Some(WorkerLoadGuard::new(prefill_worker.as_ref()));
         self.start_profiling(&prefill_base_url).await;
         self.start_profiling(&decode_base_url).await;
-
-        let (prefill_result, decode_result) = tokio::join!(
-            otel_http::send_client_request(
+        let mut prefill_succeeded = false;
+        let mut prefill_profile_stopped = false;
+        let (decode_headers_sent, decode_headers_received) = tokio::sync::oneshot::channel();
+        let prefill_fut = async {
+            let response = otel_http::prepare_client_request(
                 stage_builder(&prefill_url, prefill_dp_rank).json(&prefill_request),
                 headers,
                 ClientRequestOptions {
@@ -1936,8 +1968,45 @@ impl VllmPDRouter {
                     route: Some(path),
                     request_phase: Some("prefill"),
                 },
-            ),
-            otel_http::send_client_request(
+            )
+            .with_error_description(pd_error_description)
+            .send()
+            .await
+            .map_err(|e| PdRequestError::from_reqwest(PdPhase::Prefill, e))?;
+            if !response.status().is_success() {
+                return Err(PdDispatchError::http(PdPhase::Prefill, response));
+            }
+            // Preserve the old both-headers load/profiling boundary. Consume
+            // P's body concurrently so a reset/timeout can still cancel pending
+            // D immediately, rather than waiting for D's request deadline.
+            let (_, bytes) = tokio::try_join!(
+                async {
+                    let _ = decode_headers_received.await;
+                    drop(prefill_load.take());
+                    self.stop_profiling(&prefill_base_url).await;
+                    prefill_profile_stopped = true;
+                    Ok::<_, PdRequestError>(())
+                },
+                async {
+                    response
+                        .bytes()
+                        .await
+                        .map_err(|e| PdRequestError::from_reqwest(PdPhase::Prefill, e))
+                }
+            )?;
+            // Push identity is cached; no new handoff or usage fields are required.
+            let json = serde_json::from_slice::<Value>(&bytes).ok();
+            if let Some(json) = json.as_ref() {
+                self.maybe_cache_nixl_push_identity(&prefill_base_url, prefill_dp_rank, json);
+            }
+            if let Some(transfers) = ec_transfers.as_mut() {
+                transfers.disarm();
+            }
+            prefill_succeeded = true;
+            Ok(json)
+        };
+        let decode_fut = async {
+            let response = otel_http::prepare_client_request(
                 stage_builder(&decode_url, decode_dp_rank).json(&decode_request),
                 headers,
                 ClientRequestOptions {
@@ -1946,85 +2015,29 @@ impl VllmPDRouter {
                     route: Some(path),
                     request_phase: Some("decode"),
                 },
-            ),
-        );
-
-        prefill_worker.decrement_load();
-        self.stop_profiling(&prefill_base_url).await;
-
-        let prefill_response_json = match prefill_result {
-            Ok(resp) if resp.status().is_success() => resp
-                .bytes()
-                .await
-                .ok()
-                .and_then(|b| serde_json::from_slice::<Value>(&b).ok()),
-            Ok(resp) => {
-                self.stop_profiling(&decode_base_url).await;
-                RouterMetrics::record_pd_prefill_error(&prefill_base_url);
-                RouterMetrics::record_pd_request(path);
-                RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
-                if resp.status().is_client_error() {
-                    let status = resp.status();
-                    let content_type = resp.headers().get(http::header::CONTENT_TYPE).cloned();
-                    let mut response =
-                        (status, resp.bytes().await.unwrap_or_default()).into_response();
-                    if let Some(content_type) = content_type {
-                        response
-                            .headers_mut()
-                            .insert(http::header::CONTENT_TYPE, content_type);
-                    }
-                    return Ok(response);
-                }
-                return Err(PDRouterError::NetworkError {
-                    message: format!(
-                        "Prefill request failed to {} with status {}",
-                        prefill_url,
-                        resp.status()
-                    ),
-                });
-            }
-            Err(e) => {
-                self.stop_profiling(&decode_base_url).await;
-                RouterMetrics::record_pd_prefill_error(&prefill_base_url);
-                RouterMetrics::record_pd_request(path);
-                RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
-                return Err(PDRouterError::NetworkError {
-                    message: format!(
-                        "Prefill request failed to {}: {}",
-                        prefill_url,
-                        error_chain(&e)
-                    ),
-                });
-            }
+            )
+            .with_error_description(pd_error_description)
+            .send()
+            .await;
+            let _ = decode_headers_sent.send(());
+            response
         };
-        if let Some(prefill_json) = prefill_response_json.as_ref() {
-            self.maybe_cache_nixl_push_identity(&prefill_base_url, prefill_dp_rank, prefill_json);
+        let result = prefill_first(prefill_fut, decode_fut).await;
+        if let Err(error) = &result {
+            request_metrics.record_failure(error, &prefill_base_url, &decode_base_url);
         }
-        // Prefill succeeded and consumed the embeddings; the pending EC
-        // transfers are now owned by the decode phase, so disarm the
-        // cancel-on-abandon guard.
-        if let Some(transfers) = ec_transfers.as_mut() {
-            transfers.disarm();
+        drop(prefill_load);
+        if !prefill_profile_stopped {
+            self.stop_profiling(&prefill_base_url).await;
         }
-
-        let decode_response = match decode_result {
-            Ok(resp) => resp,
-            Err(e) => {
-                self.stop_profiling(&decode_base_url).await;
-                RouterMetrics::record_pd_decode_error(&decode_base_url);
-                RouterMetrics::record_pd_request(path);
-                RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
-                RouterMetrics::record_pd_prefill_request(&prefill_base_url);
-                return Err(PDRouterError::NetworkError {
-                    message: format!(
-                        "Decode request failed to {}: {}",
-                        decode_url,
-                        error_chain(&e)
-                    ),
-                });
-            }
-        };
-
+        if result.is_err() {
+            self.stop_profiling(&decode_base_url).await;
+        }
+        if result.is_err() && prefill_succeeded {
+            // Keep the full worker URL used by the old decode-send error exit.
+            RouterMetrics::record_pd_prefill_request(&prefill_base_url);
+        }
+        let (prefill_response_json, decode_response) = result?;
         let needs_logprobs = decode_request.get("logprobs").is_some()
             || decode_request
                 .get("echo")
@@ -2047,13 +2060,12 @@ impl VllmPDRouter {
             path,
             prefill_http,
             decode_http,
-            decode_http,
-            start_time,
+            &decode_base_url,
             is_streaming,
             needs_logprobs,
+            request_metrics,
         )
         .await
-        .map_err(|message| PDRouterError::NetworkError { message })
     }
 
     /// Create a new vLLM PD router
@@ -2304,11 +2316,8 @@ impl RouterTrait for VllmPDRouter {
     ) -> Response {
         let request_json = match serde_json::to_value(body) {
             Ok(json) => json,
-            Err(e) => {
-                return (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Serialization error: {}", e),
-                )
+            Err(_) => {
+                return PdRequestError::Internal(InternalErrorReason::SerializeRequest)
                     .into_response()
             }
         };
@@ -2324,11 +2333,8 @@ impl RouterTrait for VllmPDRouter {
     ) -> Response {
         let request_json = match serde_json::to_value(body) {
             Ok(json) => json,
-            Err(e) => {
-                return (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Serialization error: {}", e),
-                )
+            Err(_) => {
+                return PdRequestError::Internal(InternalErrorReason::SerializeRequest)
                     .into_response()
             }
         };
@@ -2366,11 +2372,8 @@ impl RouterTrait for VllmPDRouter {
                     );
                     json
                 }
-                Err(e) => {
-                    return (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Serialization error: {}", e),
-                    )
+                Err(_) => {
+                    return PdRequestError::Internal(InternalErrorReason::SerializeRequest)
                         .into_response()
                 }
             };
@@ -2391,11 +2394,8 @@ impl RouterTrait for VllmPDRouter {
                     );
                     json
                 }
-                Err(e) => {
-                    return (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Serialization error: {}", e),
-                    )
+                Err(_) => {
+                    return PdRequestError::Internal(InternalErrorReason::SerializeRequest)
                         .into_response()
                 }
             };
@@ -2459,7 +2459,7 @@ impl RouterTrait for VllmPDRouter {
                 }
             };
 
-            let (decode_idx, _decode_load) = match self.select_and_reserve_decode(
+            let (decode_idx, decode_load) = match self.select_and_reserve_decode(
                 decode_policy.as_ref(),
                 &decode_workers,
                 request_text.for_policy(decode_policy.as_ref()),
@@ -2496,6 +2496,7 @@ impl RouterTrait for VllmPDRouter {
                     decode_worker.clone(),
                     "/v1/chat/completions",
                     headers,
+                    decode_load,
                 )
                 .await
             {
@@ -2505,11 +2506,7 @@ impl RouterTrait for VllmPDRouter {
                 }
                 Err(e) => {
                     error!("Two-stage processing failed: {}", e);
-                    (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Request processing failed: {}", e),
-                    )
-                        .into_response()
+                    e.into_response()
                 }
             };
             resp
@@ -2540,11 +2537,8 @@ impl RouterTrait for VllmPDRouter {
                     );
                     json
                 }
-                Err(e) => {
-                    return (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Serialization error: {}", e),
-                    )
+                Err(_) => {
+                    return PdRequestError::Internal(InternalErrorReason::SerializeRequest)
                         .into_response()
                 }
             };
@@ -2565,11 +2559,8 @@ impl RouterTrait for VllmPDRouter {
                     );
                     json
                 }
-                Err(e) => {
-                    return (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Serialization error: {}", e),
-                    )
+                Err(_) => {
+                    return PdRequestError::Internal(InternalErrorReason::SerializeRequest)
                         .into_response()
                 }
             };
@@ -2633,7 +2624,7 @@ impl RouterTrait for VllmPDRouter {
                 }
             };
 
-            let (decode_idx, _decode_load) = match self.select_and_reserve_decode(
+            let (decode_idx, decode_load) = match self.select_and_reserve_decode(
                 decode_policy.as_ref(),
                 &decode_workers,
                 request_text.for_policy(decode_policy.as_ref()),
@@ -2670,6 +2661,7 @@ impl RouterTrait for VllmPDRouter {
                     decode_worker.clone(),
                     "/v1/completions",
                     headers,
+                    decode_load,
                 )
                 .await
             {
@@ -2679,11 +2671,7 @@ impl RouterTrait for VllmPDRouter {
                 }
                 Err(e) => {
                     error!("Two-stage processing failed: {}", e);
-                    (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Request processing failed: {}", e),
-                    )
-                        .into_response()
+                    e.into_response()
                 }
             };
             resp
@@ -2698,11 +2686,8 @@ impl RouterTrait for VllmPDRouter {
     ) -> Response {
         let request_json = match serde_json::to_value(body) {
             Ok(json) => json,
-            Err(e) => {
-                return (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Serialization error: {}", e),
-                )
+            Err(_) => {
+                return PdRequestError::Internal(InternalErrorReason::SerializeRequest)
                     .into_response()
             }
         };
@@ -2737,11 +2722,8 @@ impl RouterTrait for VllmPDRouter {
     ) -> Response {
         let request_json = match serde_json::to_value(body) {
             Ok(json) => json,
-            Err(e) => {
-                return (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Serialization error: {}", e),
-                )
+            Err(_) => {
+                return PdRequestError::Internal(InternalErrorReason::SerializeRequest)
                     .into_response()
             }
         };
@@ -2858,7 +2840,7 @@ impl RouterTrait for VllmPDRouter {
                 }
             };
 
-            let (decode_idx, _decode_load) = match self.select_and_reserve_decode(
+            let (decode_idx, decode_load) = match self.select_and_reserve_decode(
                 decode_policy.as_ref(),
                 &decode_workers,
                 request_text.for_policy(decode_policy.as_ref()),
@@ -2892,6 +2874,7 @@ impl RouterTrait for VllmPDRouter {
                     decode_worker.clone(),
                     path,
                     headers,
+                    decode_load,
                 )
                 .await
             {
@@ -2903,11 +2886,7 @@ impl RouterTrait for VllmPDRouter {
                         decode_worker.url(),
                         e
                     );
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Transparent proxy request failed: {}", e),
-                    )
-                        .into_response()
+                    e.into_response()
                 }
             }
         }
@@ -2928,6 +2907,26 @@ impl WorkerManagement for VllmPDRouter {
 
     fn get_worker_urls(&self) -> Vec<String> {
         self.pd_router.get_worker_urls()
+    }
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+mod kv_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn moriio_read_keeps_null_promotion_and_existing_fields_without_panicking() {
+        assert_eq!(
+            moriio_read_params(Value::Null, 4),
+            Some(json!({"remote_dp_size":4}))
+        );
+        assert_eq!(
+            moriio_read_params(json!({"remote_engine_id":"P", "remote_dp_size":1}), 4),
+            Some(json!({"remote_engine_id":"P", "remote_dp_size":4}))
+        );
+        for params in [json!([1, 2]), json!("invalid"), json!(true), json!(3)] {
+            assert!(moriio_read_params(params, 4).is_none());
+        }
     }
 }
 
@@ -2997,6 +2996,7 @@ mod tests {
                 .unwrap()
                 .into();
             let prefill = json!({"prompt_logprobs": [1, 2, 3]});
+            let mut request_metrics = RequestMetrics::new("/v1/chat/completions");
             let response = router
                 .handle_decode_response(
                     decode,
@@ -3004,10 +3004,10 @@ mod tests {
                     "/v1/chat/completions",
                     "prefill",
                     "decode",
-                    "decode",
-                    Instant::now(),
+                    "http://127.0.0.1",
                     streaming,
                     logprobs,
+                    &mut request_metrics,
                 )
                 .await
                 .unwrap();
@@ -3040,6 +3040,7 @@ mod tests {
                 .body(encoded.clone())
                 .unwrap()
                 .into();
+            let mut request_metrics = RequestMetrics::new("/v1/chat/completions");
             let response = router
                 .handle_decode_response(
                     decode,
@@ -3047,10 +3048,10 @@ mod tests {
                     "/v1/chat/completions",
                     "prefill",
                     "decode",
-                    "decode",
-                    Instant::now(),
+                    "http://127.0.0.1",
                     streaming,
                     false,
+                    &mut request_metrics,
                 )
                 .await
                 .unwrap();
@@ -3204,13 +3205,18 @@ mod tests {
                             .await;
                         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
                         assert_eq!(response.headers()["retry-after"], "7");
-                        assert_eq!(
-                            axum::body::to_bytes(response.into_body(), 4096)
-                                .await
-                                .unwrap()
-                                .as_ref(),
-                            b"overloaded"
-                        );
+                        assert_eq!(response.headers()["content-type"], "application/json");
+                        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                            .await
+                            .unwrap();
+                        let error: Value = serde_json::from_slice(&bytes).unwrap();
+                        assert_eq!(error["error"]["type"], "rate_limit_error");
+                        assert_eq!(error["error"]["code"], "429");
+                        assert!(error["error"]["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("decode"));
+                        assert!(!std::str::from_utf8(&bytes).unwrap().contains("overloaded"));
                     }
                 }
             }
@@ -3913,9 +3919,7 @@ mod tests {
                             .await
                             .is_err());
                     } else {
-                        assert!(result
-                            .unwrap_err()
-                            .contains("Failed to read Decode response"));
+                        assert!(matches!(result, Err(PdRequestError::Transport(_))));
                     }
                     server.await.unwrap();
                 }
