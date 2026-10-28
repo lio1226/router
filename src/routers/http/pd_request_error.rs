@@ -81,8 +81,6 @@ pub(super) struct TransportError {
 #[derive(Debug)]
 pub(super) enum InternalErrorReason {
     MoriIoTransferModeMissing,
-    SerializePrefillRequest,
-    SerializeDecodeRequest,
     SerializeRequest,
     SerializeResponse,
     BuildResponse,
@@ -381,16 +379,6 @@ mod tests {
             (
                 InternalErrorReason::MoriIoTransferModeMissing,
                 "MoriIoTransferModeMissing",
-                false,
-            ),
-            (
-                InternalErrorReason::SerializePrefillRequest,
-                "SerializePrefillRequest",
-                false,
-            ),
-            (
-                InternalErrorReason::SerializeDecodeRequest,
-                "SerializeDecodeRequest",
                 false,
             ),
             (

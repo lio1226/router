@@ -1,5 +1,5 @@
-//! Preserve HEAD's successful response and existing metric contracts while
-//! changing how P/D errors are returned.
+//! Preserve successful responses, upstream dispatch boundaries, and metric
+//! contracts while changing how P/D errors are returned.
 #![cfg(all(feature = "cpu", feature = "ready"))]
 
 mod common;
@@ -114,7 +114,7 @@ async fn discovery_error_metrics_precede_body_capture_and_survive_cancellation()
                     &handle,
                     "vllm_router_pd_prefill_errors_total",
                     "worker",
-                    f._p.url.trim_start_matches("http://")
+                    &f._p.url
                 ),
                 1
             );
@@ -133,7 +133,7 @@ async fn discovery_error_metrics_precede_body_capture_and_survive_cancellation()
 }
 
 #[tokio::test]
-async fn prefill_json_failure_keeps_the_legacy_direct_discovery_counter_difference() {
+async fn prefill_json_failure_uses_shared_stage_counters() {
     let recorder = PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
     let _guard = metrics::set_default_local_recorder(&recorder);
@@ -150,24 +150,18 @@ async fn prefill_json_failure_keeps_the_legacy_direct_discovery_counter_differen
             )
             .await;
         assert_eq!(response.status(), 500);
-        let expected = u64::from(!discovery);
         assert_eq!(
             counter(&handle, "vllm_router_pd_requests_total", "route", &path),
-            expected
+            1
         );
-        let worker = if discovery {
-            f._p.url.trim_start_matches("http://")
-        } else {
-            &f._p.url
-        };
         assert_eq!(
             counter(
                 &handle,
                 "vllm_router_pd_prefill_errors_total",
                 "worker",
-                worker
+                &f._p.url
             ),
-            expected
+            1
         );
         f.assert_no_load();
     }
@@ -214,7 +208,7 @@ async fn prefill_body_reset_still_cancels_decode_waiting_for_headers() {
 }
 
 #[tokio::test]
-async fn concurrent_profiling_keeps_each_modes_header_boundary() {
+async fn concurrent_profiling_finishes_prefill_at_body_boundary() {
     for discovery in [true, false] {
         let f = if discovery {
             Fixture::profiled_discovery(Duration::from_secs(3)).await
@@ -241,32 +235,24 @@ async fn concurrent_profiling_keeps_each_modes_header_boundary() {
         tokio::time::timeout(Duration::from_secs(2), async {
             f.control.p_body_started.notified().await;
             f.control.d_seen.notified().await;
-            if discovery {
-                // Discovery stopped P at its own headers, while D and P EOF
-                // are both blocked. This must not wait for prefill_first.
-                f.control.p_profile_stopped.notified().await;
-            }
         })
         .await
-        .expect("P profiling must obey the legacy header boundary");
+        .expect("both phases must reach their barriers");
         assert_eq!(
             f.control
                 .p_profile_stops
                 .load(std::sync::atomic::Ordering::SeqCst),
-            if discovery { 2 } else { 1 }
+            1
         );
         f.control.d_release.notify_one();
-        if !discovery {
-            // Direct concurrent mode waited for both sets of headers, but
-            // stopped P before consuming its response body.
-            tokio::time::timeout(
-                Duration::from_secs(2),
-                f.control.p_profile_stopped.notified(),
-            )
-            .await
-            .unwrap();
-        }
         assert!(!task.is_finished(), "P EOF still gates the response");
+        assert_eq!(
+            f.control
+                .p_profile_stops
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "P profiling must include successful body consumption"
+        );
         f.control.p_body_release.notify_one();
         let response = tokio::time::timeout(Duration::from_secs(2), task)
             .await
@@ -347,8 +333,8 @@ async fn response_body_failures_do_not_extend_legacy_stream_error_counter() {
     let _guard = metrics::set_default_local_recorder(&recorder);
     for streaming in [false, true] {
         let f = Fixture::direct(Duration::from_secs(2)).await;
-        // Non-streaming OpenAI bodies are now read before commitment for usage
-        // reconciliation. An opaque path still exercises byte forwarding.
+        // The mock declares an oversized non-streaming body to exercise the
+        // passthrough path. Smaller non-streaming bodies are buffered first.
         let path = if streaming {
             "/v1/chat/completions"
         } else {
@@ -529,16 +515,8 @@ async fn existing_phase_counters_and_request_timing_are_preserved() {
                     f.warmup().await;
                 }
                 let path = format!("/compat/{discovery}/{concurrent}/{model}");
-                let p = if discovery {
-                    f._p.url.trim_start_matches("http://")
-                } else {
-                    &f._p.url
-                };
-                let d = if discovery {
-                    f._d.url.trim_start_matches("http://")
-                } else {
-                    &f._d.url
-                };
+                let p = &f._p.url;
+                let d = &f._d.url;
                 let p_success = if concurrent {
                     f._p.url.trim_start_matches("http://")
                 } else {
@@ -603,7 +581,7 @@ async fn existing_phase_counters_and_request_timing_are_preserved() {
                         before_d_success + 1
                     );
                 } else {
-                    let p_increment = u64::from(model == "d-timeout" || (discovery && concurrent));
+                    let p_increment = u64::from(model == "d-timeout");
                     assert_eq!(
                         counter(
                             &handle,
@@ -628,26 +606,42 @@ async fn existing_phase_counters_and_request_timing_are_preserved() {
 
     let f = Fixture::direct(Duration::from_secs(2)).await;
     let path = "/compat/body-wait";
-    let response = tokio::time::timeout(
-        Duration::from_millis(200),
-        f.router.route_transparent(
-            None,
-            path,
-            &Method::POST,
-            json!({"model":"compat-body-wait", "messages":[]}),
-        ),
-    )
+    let request = f.router.route_transparent(
+        None,
+        path,
+        &Method::POST,
+        json!({"model":"compat-body-wait", "messages":[]}),
+    );
+    tokio::pin!(request);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if counter(&handle, "vllm_router_pd_requests_total", "route", path) == 1 {
+                break;
+            }
+            tokio::select! {
+                _ = &mut request => panic!("non-streaming body must remain buffered until EOF"),
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+    })
     .await
-    .expect("direct non-streaming response must return before upstream EOF");
-    assert_eq!(response.status(), 200);
+    .expect("request metrics must be recorded at Decode headers");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), &mut request)
+            .await
+            .is_err()
+    );
     assert_eq!(
         counter(&handle, "vllm_router_pd_requests_total", "route", path),
         1
     );
     f.control.stream_release.notify_one();
+    let response = request.await;
+    assert_eq!(response.status(), 200);
     axum::body::to_bytes(response.into_body(), 4096)
         .await
         .unwrap();
+    f.assert_no_load();
 
     let invalid_path = "/compat/invalid-input";
     assert_eq!(

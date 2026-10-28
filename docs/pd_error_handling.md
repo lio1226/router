@@ -6,8 +6,9 @@ the Prefill or Decode worker; downstream means the client calling the router.
 
 This contract covers request failures in direct and service-discovery P/D
 routing, with sequential or concurrent dispatch, for `/v1/chat/completions`,
-`/v1/completions`, and `/v1/responses`. Worker-management errors and other router
-backends have their own error handling.
+`/v1/completions`, and `/v1/responses`. Opt-in Program scheduling uses the same
+contract for chat completions and completions. Worker-management errors and
+other router backends have their own error handling.
 
 ## Status mapping
 
@@ -132,9 +133,15 @@ work does not guarantee that the remote engine immediately stops computation.
 After the downstream status and headers have been sent, a body transport failure
 terminates the body. The committed status cannot change, and the router does
 not synthesize an SSE error event or a `[DONE]` marker. This also applies to
-ordinary non-streaming responses forwarded through the direct byte-stream path.
+oversized non-streaming responses forwarded through the byte-stream path.
 Body-read or validation failures detected before commitment use the status
 mapping above.
+
+Successful Prefill bodies are bounded to 64 MiB. Non-streaming Decode bodies
+are buffered up to 64 MiB for usage reconciliation; larger bodies are forwarded
+as streams. Optional JSON enrichment, including logprobs merging, is limited
+to 8 MiB. These successful-response limits are separate from the 64 KiB
+error-body capture limit.
 
 ## Operational diagnostics
 
@@ -168,6 +175,7 @@ cargo test --offline --locked --features cpu,ready --lib pd_request_error
 cargo test --offline --locked --features cpu,ready --lib pd_dispatch
 cargo test --offline --locked --features cpu,ready --test test_pd_error_passthrough
 cargo test --offline --locked --features cpu,ready --test test_pd_error_observability
+cargo test --offline --locked --features cpu,ready --test test_pd_program_scheduling
 ```
 
 The passthrough tests include 120 combinations of direct/discovery routing,

@@ -52,8 +52,6 @@ pub(super) fn records_legacy_request(error: &PdRequestError) -> bool {
     match error {
         PdRequestError::Internal(reason) => match reason {
             InternalErrorReason::MoriIoTransferModeMissing
-            | InternalErrorReason::SerializePrefillRequest
-            | InternalErrorReason::SerializeDecodeRequest
             | InternalErrorReason::SerializeRequest => false,
             InternalErrorReason::SerializeResponse
             | InternalErrorReason::BuildResponse
@@ -95,7 +93,6 @@ pub(super) struct RequestMetrics<'a> {
     route: &'a str,
     start: std::time::Instant,
     recorded: bool,
-    count_errors: bool,
 }
 impl<'a> RequestMetrics<'a> {
     pub(super) fn new(route: &'a str) -> Self {
@@ -103,14 +100,10 @@ impl<'a> RequestMetrics<'a> {
             route,
             start: std::time::Instant::now(),
             recorded: false,
-            count_errors: true,
         }
     }
-    pub(super) fn exclude_legacy_error(&mut self) {
-        self.count_errors = false;
-    }
     pub(super) fn record_error(&mut self) -> bool {
-        self.count_errors && self.record()
+        self.record()
     }
     /// Returns true only for the first observation. Response-body failures
     /// must not count the request or its worker error a second time.

@@ -276,11 +276,19 @@ async fn stage(State(stage): State<Stage>, request: Request) -> Response {
             Err::<Bytes, _>(std::io::Error::other("safe-test-reset"))
         });
         let stream = futures_util::StreamExt::chain(first, reset);
-        return (
+        let mut response = (
             [("content-type", "text/event-stream")],
             axum::body::Body::from_stream(stream),
         )
             .into_response();
+        if body.get("stream").and_then(Value::as_bool) != Some(true) {
+            // Enter the bounded-buffer overflow path without allocating 64 MiB.
+            response.headers_mut().insert(
+                http::header::CONTENT_LENGTH,
+                (64 * 1024 * 1024 + 1).to_string().parse().unwrap(),
+            );
+        }
+        return response;
     }
     if let Some(code) = (forced_status != 0)
         .then_some(forced_status as u16)
